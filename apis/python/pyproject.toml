@@ -58,3 +58,7 @@ single-line-exclusions = ["typing", "typing_extensions"]
 
 [tool.scikit-build]
 wheel.expand-macos-universal-tags = true
+
+[[tool.cibuildwheel.overrides]]
+select = "*-musllinux*"
+before-all = "apk del gcc g++ gfortran && apk add gcc g++ gfortran --repository=http://dl-3.alpinelinux.org/alpine/v3.19/main"
