@@ -3,15 +3,17 @@ import multiprocessing
 from typing import Any, Mapping
 
 import numpy as np
-from tiledb.cloud.dag import Mode
 
+from tiledb.cloud.dag import Mode
 from tiledb.vector_search import index
 from tiledb.vector_search.module import *
-from tiledb.vector_search.storage_formats import (STORAGE_VERSION,
-                                                  storage_formats,
-                                                  validate_storage_version)
+from tiledb.vector_search.storage_formats import STORAGE_VERSION
+from tiledb.vector_search.storage_formats import storage_formats
+from tiledb.vector_search.storage_formats import validate_storage_version
+from tiledb.vector_search.utils import add_to_group
 
 MAX_INT32 = np.iinfo(np.dtype("int32")).max
+MAX_UINT64 = np.iinfo(np.dtype("uint64")).max
 TILE_SIZE_BYTES = 64000000  # 64MB
 INDEX_TYPE = "IVF_FLAT"
 
@@ -157,17 +159,17 @@ class IVFFlatIndex(index.Index):
             wether to use the nuv query implementation. Default: False
         mode: Mode
             If provided the query will be executed using TileDB cloud taskgraphs.
-            For distributed execution you can use REALTIME or BATCH mode. 
+            For distributed execution you can use REALTIME or BATCH mode.
             For local execution you can use LOCAL mode.
-        resource_class: 
+        resource_class:
             The name of the resource class to use ("standard" or "large"). Resource classes define maximum
             limits for cpu and memory usage. Can only be used in REALTIME or BATCH mode.
             Cannot be used alongside resources.
             In REALTIME or BATCH mode if neither resource_class nor resources are provided,
             we default to the "large" resource class.
         resources:
-            A specification for the amount of resources to use when executing using TileDB cloud 
-            taskgraphs, of the form: {"cpu": "6", "memory": "12Gi", "gpu": 1}. Can only be used 
+            A specification for the amount of resources to use when executing using TileDB cloud
+            taskgraphs, of the form: {"cpu": "6", "memory": "12Gi", "gpu": 1}. Can only be used
             in BATCH mode. Cannot be used alongside resource_class.
         num_partitions: int
             Only relevant for taskgraph based execution.
@@ -272,17 +274,17 @@ class IVFFlatIndex(index.Index):
             Number of threads to use for query
         mode: Mode
             If provided the query will be executed using TileDB cloud taskgraphs.
-            For distributed execution you can use REALTIME or BATCH mode. 
+            For distributed execution you can use REALTIME or BATCH mode.
             For local execution you can use LOCAL mode.
-        resource_class: 
+        resource_class:
             The name of the resource class to use ("standard" or "large"). Resource classes define maximum
             limits for cpu and memory usage. Can only be used in REALTIME or BATCH mode.
             Cannot be used alongside resources.
             In REALTIME or BATCH mode if neither resource_class nor resources are provided,
             we default to the "large" resource class.
         resources:
-            A specification for the amount of resources to use when executing using TileDB cloud 
-            taskgraphs, of the form: {"cpu": "6", "memory": "12Gi", "gpu": 1}. Can only be used 
+            A specification for the amount of resources to use when executing using TileDB cloud
+            taskgraphs, of the form: {"cpu": "6", "memory": "12Gi", "gpu": 1}. Can only be used
             in BATCH mode. Cannot be used alongside resource_class.
         num_partitions: int
             Only relevant for taskgraph based execution.
@@ -297,11 +299,12 @@ class IVFFlatIndex(index.Index):
         from functools import partial
 
         import numpy as np
+
         from tiledb.cloud import dag
         from tiledb.cloud.dag import Mode
-
-        from tiledb.vector_search.module import (array_to_matrix, dist_qv,
-                                                 partition_ivf_index)
+        from tiledb.vector_search.module import array_to_matrix
+        from tiledb.vector_search.module import dist_qv
+        from tiledb.vector_search.module import partition_ivf_index
 
         if resource_class and resources:
             raise TypeError("Cannot provide both resource_class and resources")
@@ -411,7 +414,9 @@ class IVFFlatIndex(index.Index):
                     k_nn=k,
                     config=config,
                     timestamp=self.base_array_timestamp,
-                    resource_class="large" if (not resources and not resource_class) else resource_class,
+                    resource_class="large"
+                    if (not resources and not resource_class)
+                    else resource_class,
                     resources=resources,
                     image_name="3.9-vectorsearch",
                 )
@@ -436,12 +441,8 @@ class IVFFlatIndex(index.Index):
             tmp = sorted(tmp_results, key=lambda t: t[0])[0:k]
             for j in range(len(tmp), k):
                 tmp.append((float(0.0), int(0)))
-            results_per_query_d.append(
-                np.array(tmp, dtype=np.dtype("float,uint64"))["f0"]
-            )
-            results_per_query_i.append(
-                np.array(tmp, dtype=np.dtype("float,uint64"))["f1"]
-            )
+            results_per_query_d.append(np.array(tmp, dtype=np.float32)[:, 0])
+            results_per_query_i.append(np.array(tmp, dtype=np.uint64)[:, 1])
         return np.array(results_per_query_d), np.array(results_per_query_i)
 
 
@@ -465,6 +466,7 @@ def create(
         group_exists=group_exists,
         config=config,
     )
+    # TODO(paris): Save training_source_uri as metadata so that we use it for re-ingestion's.
     with tiledb.scope_ctx(ctx_or_config=config):
         group = tiledb.Group(uri, "w")
         tile_size = int(TILE_SIZE_BYTES / np.dtype(vector_type).itemsize / dimensions)
@@ -473,10 +475,12 @@ def create(
         index_array_name = storage_formats[storage_version]["INDEX_ARRAY_NAME"]
         ids_array_name = storage_formats[storage_version]["IDS_ARRAY_NAME"]
         parts_array_name = storage_formats[storage_version]["PARTS_ARRAY_NAME"]
+        updates_array_name = storage_formats[storage_version]["UPDATES_ARRAY_NAME"]
         centroids_uri = f"{uri}/{centroids_array_name}"
         index_array_uri = f"{uri}/{index_array_name}"
         ids_uri = f"{uri}/{ids_array_name}"
         parts_uri = f"{uri}/{parts_array_name}"
+        updates_array_uri = f"{uri}/{updates_array_name}"
 
         centroids_array_rows_dim = tiledb.Dim(
             name="rows",
@@ -506,7 +510,7 @@ def create(
             tile_order="col-major",
         )
         tiledb.Array.create(centroids_uri, centroids_schema)
-        group.add(centroids_uri, name=centroids_array_name)
+        add_to_group(group, centroids_uri, name=centroids_array_name)
 
         index_array_rows_dim = tiledb.Dim(
             name="rows",
@@ -528,7 +532,7 @@ def create(
             tile_order="col-major",
         )
         tiledb.Array.create(index_array_uri, index_schema)
-        group.add(index_array_uri, name=index_array_name)
+        add_to_group(group, index_array_uri, name=index_array_name)
 
         ids_array_rows_dim = tiledb.Dim(
             name="rows",
@@ -550,7 +554,7 @@ def create(
             tile_order="col-major",
         )
         tiledb.Array.create(ids_uri, ids_schema)
-        group.add(ids_uri, name=ids_array_name)
+        add_to_group(group, ids_uri, name=ids_array_name)
 
         parts_array_rows_dim = tiledb.Dim(
             name="rows",
@@ -578,7 +582,23 @@ def create(
             tile_order="col-major",
         )
         tiledb.Array.create(parts_uri, parts_schema)
-        group.add(parts_uri, name=parts_array_name)
+        add_to_group(group, parts_uri, name=parts_array_name)
+
+        external_id_dim = tiledb.Dim(
+            name="external_id",
+            domain=(0, MAX_UINT64 - 1),
+            dtype=np.dtype(np.uint64),
+        )
+        dom = tiledb.Domain(external_id_dim)
+        vector_attr = tiledb.Attr(name="vector", dtype=vector_type, var=True)
+        updates_schema = tiledb.ArraySchema(
+            domain=dom,
+            sparse=True,
+            attrs=[vector_attr],
+            allows_duplicates=False,
+        )
+        tiledb.Array.create(updates_array_uri, updates_schema)
+        add_to_group(group, updates_array_uri, name=updates_array_name)
 
         group.close()
         return IVFFlatIndex(uri=uri, config=config, memory_budget=1000000)

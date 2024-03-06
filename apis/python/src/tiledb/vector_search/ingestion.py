@@ -1,12 +1,22 @@
-import json
+import enum
 from functools import partial
 from typing import Any, Mapping, Optional, Tuple
 
 import numpy as np
-from tiledb.cloud.dag import Mode
 
+from tiledb.cloud.dag import Mode
 from tiledb.vector_search._tiledbvspy import *
-from tiledb.vector_search.storage_formats import STORAGE_VERSION, validate_storage_version
+from tiledb.vector_search.storage_formats import STORAGE_VERSION
+from tiledb.vector_search.storage_formats import validate_storage_version
+from tiledb.vector_search.utils import add_to_group
+
+
+class TrainingSamplingPolicy(enum.Enum):
+    FIRST_N = 1
+    RANDOM = 2
+
+    def __str__(self):
+        return self.name.replace("_", " ").title()
 
 
 def ingest(
@@ -25,15 +35,21 @@ def ingest(
     namespace: Optional[str] = None,
     size: int = -1,
     partitions: int = -1,
+    training_sampling_policy: TrainingSamplingPolicy = TrainingSamplingPolicy.FIRST_N,
     copy_centroids_uri: str = None,
     training_sample_size: int = -1,
+    training_input_vectors: np.ndarray = None,
+    training_source_uri: str = None,
+    training_source_type: str = None,
     workers: int = -1,
     input_vectors_per_work_item: int = -1,
-    max_tasks_per_stage: int= -1,
+    max_tasks_per_stage: int = -1,
+    input_vectors_per_work_item_during_sampling: int = -1,
+    max_sampling_tasks: int = -1,
     storage_version: str = STORAGE_VERSION,
     verbose: bool = False,
     trace_id: Optional[str] = None,
-    use_sklearn: bool = False,
+    use_sklearn: bool = True,
     mode: Mode = Mode.LOCAL,
     **kwargs,
 ):
@@ -78,6 +94,18 @@ def ingest(
     training_sample_size: int = -1
         vector sample size to train centroids with,
         if not provided, is auto-configured based on the dataset sizes
+        should not be provided if training_source_uri is provided
+    training_input_vectors: numpy Array
+        Training input vectors, if this is provided it takes precedence over training_source_uri and training_source_type
+        should not be provided if training_sample_size or training_source_uri is provided
+    training_source_uri: str = None
+        The source URI to use for training centroids when building a IVF_FLAT vector index,
+        if not provided, the first training_sample_size vectors from source_uri are used
+        should not be provided if training_sample_size or training_input_vectors is provided
+    training_source_type: str = None
+        Type of the training source data in training_source_uri
+        if left empty, is auto-detected from the suffix of training_source_type
+        should only be provided when training_source_uri is provided
     workers: int = -1
         number of workers for vector ingestion,
         if not provided, is auto-configured based on the dataset size
@@ -87,6 +115,14 @@ def ingest(
     max_tasks_per_stage: int = -1
         Max number of tasks per execution stage of ingestion,
         if not provided, is auto-configured
+    input_vectors_per_work_item_during_sampling: int = -1
+        number of vectors per sample ingestion work item,
+        if not provided, is auto-configured
+        only valid with training_sampling_policy=TrainingSamplingPolicy.RANDOM
+    max_sampling_tasks: int = -1
+        Max number of tasks per execution stage of sampling,
+        if not provided, is auto-configured
+        only valid with training_sampling_policy=TrainingSamplingPolicy.RANDOM
     storage_version: str
         Vector index storage format version. If not provided, defaults to the latest version.
     verbose: bool
@@ -95,7 +131,7 @@ def ingest(
         trace ID for logging, defaults to None
     use_sklearn: bool
         Whether to use scikit-learn's implementation of k-means clustering instead of
-        tiledb.vector_search's. Defaults to false.
+        tiledb.vector_search's. Defaults to true.
     mode: Mode
         execution mode, defaults to LOCAL use BATCH for distributed execution
     """
@@ -106,20 +142,93 @@ def ingest(
     import multiprocessing
     import os
     import time
-    from datetime import datetime
     from typing import Any, Mapping
 
     import numpy as np
-    from tiledb.cloud import dag
-    from tiledb.cloud.rest_api import models
-    from tiledb.cloud.utilities import get_logger, set_aws_context
 
     import tiledb
-    from tiledb.vector_search import flat_index, ivf_flat_index
-    from tiledb.vector_search.index import Index
+    from tiledb.cloud import dag
+    from tiledb.cloud.rest_api import models
+    from tiledb.cloud.utilities import get_logger
+    from tiledb.cloud.utilities import set_aws_context
+    from tiledb.vector_search import flat_index
+    from tiledb.vector_search import ivf_flat_index
     from tiledb.vector_search.storage_formats import storage_formats
 
     validate_storage_version(storage_version)
+
+    if source_type and not source_uri:
+        raise ValueError("source_type should not be provided without source_uri")
+    if source_uri and input_vectors:
+        raise ValueError("source_uri should not be provided alongside input_vectors")
+    if source_type and input_vectors:
+        raise ValueError("source_type should not be provided alongside input_vectors")
+
+    if training_source_uri and training_sample_size != -1:
+        raise ValueError(
+            "training_source_uri and training_sample_size should not both be provided"
+        )
+    if training_source_uri and training_input_vectors is not None:
+        raise ValueError(
+            "training_source_uri and training_input_vectors should not both be provided"
+        )
+
+    if training_input_vectors is not None and training_sample_size != -1:
+        raise ValueError(
+            "training_input_vectors and training_sample_size should not both be provided"
+        )
+    if training_input_vectors is not None and training_source_type:
+        raise ValueError(
+            "training_input_vectors and training_source_type should not both be provided"
+        )
+
+    if training_source_type and not training_source_uri:
+        raise ValueError(
+            "training_source_type should not be provided without training_source_uri"
+        )
+
+    if training_sample_size < -1:
+        raise ValueError(
+            "training_sample_size should either be positive or -1 (to auto-configure based on the dataset sizes)"
+        )
+
+    if copy_centroids_uri is not None and training_sample_size != -1:
+        raise ValueError(
+            "training_sample_size should not be provided alongside copy_centroids_uri"
+        )
+    if copy_centroids_uri is not None and partitions == -1:
+        raise ValueError(
+            "partitions should be provided if copy_centroids_uri is provided (set partitions to the number of centroids in copy_centroids_uri)"
+        )
+
+    if index_type != "IVF_FLAT" and training_sample_size != -1:
+        raise ValueError(
+            "training_sample_size should only be provided with index_type IVF_FLAT"
+        )
+    for variable in [
+        "copy_centroids_uri",
+        "training_input_vectors",
+        "training_source_uri",
+        "training_source_type",
+    ]:
+        if index_type != "IVF_FLAT" and locals().get(variable) is not None:
+            raise ValueError(
+                f"{variable} should only be provided with index_type IVF_FLAT"
+            )
+
+    for variable in [
+        "copy_centroids_uri",
+        "training_input_vectors",
+        "training_source_uri",
+        "training_source_type",
+    ]:
+        if (
+            training_sampling_policy != TrainingSamplingPolicy.FIRST_N
+            and locals().get(variable) is not None
+        ):
+            raise ValueError(
+                f"{variable} should not provided alonside training_sampling_policy"
+            )
 
     # use index_group_uri for internal clarity
     index_group_uri = index_uri
@@ -131,6 +240,9 @@ def ingest(
     INPUT_VECTORS_ARRAY_NAME = storage_formats[storage_version][
         "INPUT_VECTORS_ARRAY_NAME"
     ]
+    TRAINING_INPUT_VECTORS_ARRAY_NAME = storage_formats[storage_version][
+        "TRAINING_INPUT_VECTORS_ARRAY_NAME"
+    ]
     EXTERNAL_IDS_ARRAY_NAME = storage_formats[storage_version][
         "EXTERNAL_IDS_ARRAY_NAME"
     ]
@@ -139,6 +251,7 @@ def ingest(
     ]
     DEFAULT_ATTR_FILTERS = storage_formats[storage_version]["DEFAULT_ATTR_FILTERS"]
     VECTORS_PER_WORK_ITEM = 20000000
+    VECTORS_PER_SAMPLE_WORK_ITEM = 1000000
     MAX_TASKS_PER_STAGE = 100
     CENTRALISED_KMEANS_MAX_SAMPLE_SIZE = 1000000
     DEFAULT_IMG_NAME = "3.9-vectorsearch"
@@ -207,7 +320,27 @@ def ingest(
             schema = tiledb.ArraySchema.load(source_uri)
             size = schema.domain.dim(1).domain[1] + 1
             dimensions = schema.domain.dim(0).domain[1] + 1
-            return size, dimensions, schema.attr("values").dtype
+            return size, dimensions, schema.attr(0).dtype
+        if source_type == "TILEDB_SPARSE_ARRAY":
+            schema = tiledb.ArraySchema.load(source_uri)
+            size = schema.domain.dim(0).domain[1] + 1
+            dimensions = schema.domain.dim(1).domain[1] + 1
+            return size, dimensions, schema.attr(0).dtype
+        if source_type == "TILEDB_PARTITIONED_ARRAY":
+            with tiledb.open(source_uri, "r", config=config) as source_array:
+                q = source_array.query(attrs=("vectors_shape",), coords=True)
+                nonempty_object_array_domain = source_array.nonempty_domain()
+                partition_shapes = q[
+                    nonempty_object_array_domain[0][0] : nonempty_object_array_domain[
+                        0
+                    ][1]
+                    + 1
+                ]["vectors_shape"]
+                size = 0
+                for partition_shape in partition_shapes:
+                    size += partition_shape[0]
+                    dimensions = partition_shape[1]
+                return size, dimensions, source_array.schema.attr("vectors").dtype
         elif source_type == "U8BIN":
             vfs = tiledb.VFS()
             with vfs.open(source_uri, "rb") as f:
@@ -248,16 +381,18 @@ def ingest(
                 size = int(file_size / vector_size)
                 return size, dimensions, np.uint8
         else:
-            raise ValueError(f"Not supported source_type {source_type}")
+            raise ValueError(
+                f"Not supported source_type {source_type} - valid types are [TILEDB_ARRAY, TILEDB_SPARSE_ARRAY, U8BIN, F32BIN, FVEC, IVEC, BVEC]"
+            )
 
-    def write_input_vectors(
+    def create_array(
         group: tiledb.Group,
-        input_vectors: np.ndarray,
         size: int,
         dimensions: int,
         vector_type: np.dtype,
+        array_name: str,
     ) -> str:
-        input_vectors_array_uri = f"{group.uri}/{INPUT_VECTORS_ARRAY_NAME}"
+        input_vectors_array_uri = f"{group.uri}/{array_name}"
         if tiledb.array_exists(input_vectors_array_uri):
             raise ValueError(f"Array exists {input_vectors_array_uri}")
         tile_size = min(
@@ -295,7 +430,25 @@ def ingest(
         )
         logger.debug(input_vectors_array_schema)
         tiledb.Array.create(input_vectors_array_uri, input_vectors_array_schema)
-        group.add(input_vectors_array_uri, name=INPUT_VECTORS_ARRAY_NAME)
+        add_to_group(group, input_vectors_array_uri, array_name)
+
+        return input_vectors_array_uri
+
+    def write_input_vectors(
+        group: tiledb.Group,
+        input_vectors: np.ndarray,
+        size: int,
+        dimensions: int,
+        vector_type: np.dtype,
+        array_name: str,
+    ) -> str:
+        input_vectors_array_uri = create_array(
+            group=group,
+            size=size,
+            dimensions=dimensions,
+            vector_type=vector_type,
+            array_name=array_name,
+        )
 
         input_vectors_array = tiledb.open(
             input_vectors_array_uri, "w", timestamp=index_timestamp
@@ -338,7 +491,7 @@ def ingest(
         )
         logger.debug(ids_schema)
         tiledb.Array.create(external_ids_array_uri, ids_schema)
-        group.add(external_ids_array_uri, name=IDS_ARRAY_NAME)
+        add_to_group(group, external_ids_array_uri, EXTERNAL_IDS_ARRAY_NAME)
 
         external_ids_array = tiledb.open(
             external_ids_array_uri, "w", timestamp=index_timestamp
@@ -367,7 +520,7 @@ def ingest(
                     vector_type=vector_type,
                     group_exists=True,
                     config=config,
-                    storage_version=storage_version
+                    storage_version=storage_version,
                 )
         elif index_type == "IVF_FLAT":
             if not arrays_created:
@@ -377,7 +530,7 @@ def ingest(
                     vector_type=vector_type,
                     group_exists=True,
                     config=config,
-                    storage_version=storage_version
+                    storage_version=storage_version,
                 )
             tile_size = int(
                 ivf_flat_index.TILE_SIZE_BYTES
@@ -405,7 +558,7 @@ def ingest(
                     )
                 raise err
             partial_write_array_group = tiledb.Group(partial_write_array_dir_uri, "w")
-            group.add(partial_write_array_dir_uri, name=PARTIAL_WRITE_ARRAY_DIR)
+            add_to_group(group, partial_write_array_dir_uri, PARTIAL_WRITE_ARRAY_DIR)
 
             try:
                 tiledb.group_create(partial_write_array_index_uri)
@@ -416,8 +569,10 @@ def ingest(
                         f"Group '{partial_write_array_index_uri}' already exists"
                     )
                 raise err
-            partial_write_array_group.add(
-                partial_write_array_index_uri, name=INDEX_ARRAY_NAME
+            add_to_group(
+                partial_write_array_group,
+                partial_write_array_index_uri,
+                INDEX_ARRAY_NAME,
             )
             partial_write_array_index_group = tiledb.Group(
                 partial_write_array_index_uri, "w"
@@ -447,8 +602,10 @@ def ingest(
                 )
                 logger.debug(ids_schema)
                 tiledb.Array.create(partial_write_array_ids_uri, ids_schema)
-                partial_write_array_group.add(
-                    partial_write_array_ids_uri, name=IDS_ARRAY_NAME
+                add_to_group(
+                    partial_write_array_group,
+                    partial_write_array_ids_uri,
+                    IDS_ARRAY_NAME,
                 )
 
             if not tiledb.array_exists(partial_write_array_parts_uri):
@@ -481,9 +638,12 @@ def ingest(
                 logger.debug(parts_schema)
                 logger.debug(partial_write_array_parts_uri)
                 tiledb.Array.create(partial_write_array_parts_uri, parts_schema)
-                partial_write_array_group.add(
-                    partial_write_array_parts_uri, name=PARTS_ARRAY_NAME
+                add_to_group(
+                    partial_write_array_group,
+                    partial_write_array_parts_uri,
+                    PARTS_ARRAY_NAME,
                 )
+
             for part in range(input_vectors_work_items):
                 part_index_uri = partial_write_array_index_uri + "/" + str(part)
                 if not tiledb.array_exists(part_index_uri):
@@ -510,7 +670,9 @@ def ingest(
                     )
                     logger.debug(index_schema)
                     tiledb.Array.create(part_index_uri, index_schema)
-                    partial_write_array_index_group.add(part_index_uri, name=str(part))
+                    add_to_group(
+                        partial_write_array_index_group, part_index_uri, str(part)
+                    )
             if updates_uri is not None:
                 part_index_uri = partial_write_array_index_uri + "/additions"
                 if not tiledb.array_exists(part_index_uri):
@@ -537,7 +699,9 @@ def ingest(
                     )
                     logger.debug(index_schema)
                     tiledb.Array.create(part_index_uri, index_schema)
-                    partial_write_array_index_group.add(part_index_uri, name="additions")
+                    add_to_group(
+                        partial_write_array_index_group, part_index_uri, "additions"
+                    )
             partial_write_array_group.close()
             partial_write_array_index_group.close()
 
@@ -564,6 +728,41 @@ def ingest(
                 external_ids_uri, mode="r", timestamp=index_timestamp
             ) as external_ids_array:
                 return external_ids_array[start_pos:end_pos]["values"]
+        elif source_type == "TILEDB_PARTITIONED_ARRAY":
+            with tiledb.open(source_uri, "r") as source_array:
+                q = source_array.query(attrs=("vectors_shape",), coords=True)
+                nonempty_object_array_domain = source_array.nonempty_domain()
+                partitions = q[
+                    nonempty_object_array_domain[0][0] : nonempty_object_array_domain[
+                        0
+                    ][1]
+                    + 1
+                ]
+                partition_idx_start = 0
+                partition_idx_end = 0
+                i = 0
+                external_ids = None
+                for partition_shape in partitions["vectors_shape"]:
+                    partition_id = partitions["partition_id"][i]
+                    partition_idx_end += partition_shape[0]
+                    intersection_start = max(start_pos, partition_idx_start)
+                    intersection_end = min(end_pos, partition_idx_end)
+                    if intersection_start < intersection_end:
+                        crop_start = intersection_start - partition_idx_start
+                        crop_end = intersection_end - partition_idx_start
+                        qv = source_array.query(attrs=("external_ids",), coords=True)
+                        partition_external_ids = qv[partition_id : partition_id + 1][
+                            "external_ids"
+                        ][0][crop_start:crop_end]
+                        if external_ids is None:
+                            external_ids = partition_external_ids
+                        else:
+                            external_ids = np.concatenate(
+                                (external_ids, partition_external_ids)
+                            )
+                    partition_idx_start = partition_idx_end
+                    i += 1
+            return external_ids
         elif external_ids_type == "U64BIN":
             vfs = tiledb.VFS()
             read_size = end_pos - start_pos
@@ -644,9 +843,65 @@ def ingest(
             with tiledb.open(
                 source_uri, mode="r", timestamp=index_timestamp
             ) as src_array:
+                src_array_schema = src_array.schema
                 return np.transpose(
-                    src_array[0:dimensions, start_pos:end_pos]["values"]
+                    src_array[0:dimensions, start_pos:end_pos][
+                        src_array_schema.attr(0).name
+                    ]
                 ).copy(order="C")
+        if source_type == "TILEDB_SPARSE_ARRAY":
+            from scipy.sparse import coo_matrix
+
+            with tiledb.open(
+                source_uri, mode="r", timestamp=index_timestamp
+            ) as src_array:
+                src_array_schema = src_array.schema
+                data = src_array[start_pos:end_pos, 0:dimensions]
+                return coo_matrix(
+                    (
+                        data[src_array_schema.attr(0).name],
+                        (
+                            data[src_array_schema.domain.dim(0).name] - start_pos,
+                            data[src_array_schema.domain.dim(1).name],
+                        ),
+                    )
+                ).toarray()
+        elif source_type == "TILEDB_PARTITIONED_ARRAY":
+            with tiledb.open(
+                source_uri, "r", timestamp=index_timestamp, config=config
+            ) as source_array:
+                q = source_array.query(attrs=("vectors_shape",), coords=True)
+                nonempty_object_array_domain = source_array.nonempty_domain()
+                partitions = q[
+                    nonempty_object_array_domain[0][0] : nonempty_object_array_domain[
+                        0
+                    ][1]
+                    + 1
+                ]
+                partition_idx_start = 0
+                partition_idx_end = 0
+                i = 0
+                vectors = None
+                for partition_shape in partitions["vectors_shape"]:
+                    partition_id = partitions["partition_id"][i]
+                    partition_idx_end += partition_shape[0]
+                    intersection_start = max(start_pos, partition_idx_start)
+                    intersection_end = min(end_pos, partition_idx_end)
+                    if intersection_start < intersection_end:
+                        crop_start = intersection_start - partition_idx_start
+                        crop_end = intersection_end - partition_idx_start
+                        qv = source_array.query(attrs=("vectors",), coords=True)
+                        partition_vectors = np.reshape(
+                            qv[partition_id : partition_id + 1]["vectors"][0],
+                            partition_shape,
+                        )[crop_start:crop_end]
+                        if vectors is None:
+                            vectors = partition_vectors
+                        else:
+                            vectors = np.concatenate((vectors, partition_vectors))
+                    partition_idx_start = partition_idx_end
+                    i += 1
+            return vectors
         elif source_type == "U8BIN":
             vfs = tiledb.VFS()
             read_size = end_pos - start_pos
@@ -723,6 +978,8 @@ def ingest(
     def copy_centroids(
         index_group_uri: str,
         copy_centroids_uri: str,
+        partitions: int,
+        dimensions: int,
         config: Optional[Mapping[str, Any]] = None,
         verbose: bool = False,
         trace_id: Optional[str] = None,
@@ -735,13 +992,107 @@ def ingest(
         )
         src = tiledb.open(copy_centroids_uri, mode="r")
         dest = tiledb.open(centroids_uri, mode="w", timestamp=index_timestamp)
-        src_centroids = src[:, :]
-        dest[:, :] = src_centroids
+        src_centroids = src[0:dimensions, 0:partitions]
+        dest[0:dimensions, 0:partitions] = src_centroids
         logger.debug(src_centroids)
 
     # --------------------------------------------------------------------
     # centralised kmeans UDFs
     # --------------------------------------------------------------------
+    def random_sample_from_input_vectors(
+        source_uri: str,
+        source_type: str,
+        vector_type: np.dtype,
+        dimensions: int,
+        source_start_pos: int,
+        source_end_pos: int,
+        batch: int,
+        random_sample_size: int,
+        output_source_uri: str,
+        output_start_pos: int,
+        config: Optional[Mapping[str, Any]] = None,
+        verbose: bool = False,
+    ):
+        """
+        Reads a random sample of vectors from the source data and appends them to the output array.
+
+        Parameters
+        ----------
+        source_uri: str
+            Data source URI.
+        source_type: str
+            Type of the source data.
+        vector_type: np.dtype
+            Type of the vectors.
+        dimensions: int
+            Number of dimensions in a vector.
+        vector_start_pos: int
+            Start position of source_uri to read from.
+        vector_end_pos: int
+            End position of source_uri to read to.
+        batch: int
+            Read the source data in batches of this size.
+        random_sample_size: int
+            Number of vectors to randomly sample from the source data.
+        output_source_uri: str
+            URI of the output array.
+        output_start_pos: int
+            Start position of the output array to write to.
+        """
+        if random_sample_size == 0:
+            return
+
+        with tiledb.scope_ctx(ctx_or_config=config):
+            source_size = source_end_pos - source_start_pos
+            num_sampled = 0
+            for start in range(source_start_pos, source_end_pos, batch):
+                # What vectors to read from the source_uri.
+                end = start + batch
+                if end > source_end_pos:
+                    end = source_end_pos
+
+                # How many vectors sample from the vectors read.
+                percent_of_data_to_read = (end - start) / source_size
+                num_to_sample = math.ceil(random_sample_size * percent_of_data_to_read)
+                if num_sampled + num_to_sample > random_sample_size:
+                    num_to_sample = random_sample_size - num_sampled
+                if num_to_sample == 0:
+                    continue
+                num_sampled += num_to_sample
+
+                # Read from the source data.
+                vectors = read_input_vectors(
+                    source_uri=source_uri,
+                    source_type=source_type,
+                    vector_type=vector_type,
+                    dimensions=dimensions,
+                    start_pos=start,
+                    end_pos=end,
+                    config=config,
+                    verbose=verbose,
+                    trace_id=trace_id,
+                )
+
+                # Randomly sample from the data we read.
+                row_indices = np.random.choice(
+                    vectors.shape[0], size=num_to_sample, replace=False
+                )
+                sampled_vectors = vectors[row_indices]
+
+                # Append to output array.
+                with tiledb.open(
+                    output_source_uri, mode="w", timestamp=index_timestamp
+                ) as A:
+                    A[
+                        0:dimensions,
+                        output_start_pos : output_start_pos + num_to_sample,
+                    ] = np.transpose(sampled_vectors)
+
+        if num_sampled != random_sample_size:
+            raise ValueError(
+                f"The random sampling within a batch ran into an issue: num_sampled ({num_sampled}) != random_sample_size ({random_sample_size})"
+            )
+
     def centralised_kmeans(
         index_group_uri: str,
         source_uri: str,
@@ -749,60 +1100,94 @@ def ingest(
         vector_type: np.dtype,
         partitions: int,
         dimensions: int,
-        sample_start_pos: int,
-        sample_end_pos: int,
+        training_sample_size: int,
+        training_source_uri: Optional[str],
+        training_source_type: Optional[str],
         init: str = "random",
         max_iter: int = 10,
         n_init: int = 1,
         config: Optional[Mapping[str, Any]] = None,
         verbose: bool = False,
         trace_id: Optional[str] = None,
-        use_sklearn: bool = False
+        use_sklearn: bool = True,
     ):
         from sklearn.cluster import KMeans
 
-        from tiledb.vector_search.module import (
-            array_to_matrix,
-            kmeans_fit,
-        )
+        from tiledb.vector_search.module import array_to_matrix
+
         with tiledb.scope_ctx(ctx_or_config=config):
             logger = setup(config, verbose)
             group = tiledb.Group(index_group_uri)
             centroids_uri = group[CENTROIDS_ARRAY_NAME].uri
-            verb = 0
-            if verbose:
-                verb = 3
+            if training_sample_size >= partitions:
+                if training_source_uri:
+                    if training_source_type is None:
+                        training_source_type = autodetect_source_type(
+                            source_uri=training_source_uri
+                        )
+                    (
+                        training_in_size,
+                        training_dimensions,
+                        training_vector_type,
+                    ) = read_source_metadata(
+                        source_uri=training_source_uri, source_type=training_source_type
+                    )
+                    if dimensions != training_dimensions:
+                        raise ValueError(
+                            f"When training centroids, the index data dimensions ({dimensions}) != the training data dimensions ({training_dimensions})"
+                        )
+                    sample_vectors = read_input_vectors(
+                        source_uri=training_source_uri,
+                        source_type=training_source_type,
+                        vector_type=training_vector_type,
+                        dimensions=dimensions,
+                        start_pos=0,
+                        end_pos=training_in_size,
+                        config=config,
+                        verbose=verbose,
+                        trace_id=trace_id,
+                    ).astype(np.float32)
+                else:
+                    sample_vectors = read_input_vectors(
+                        source_uri=source_uri,
+                        source_type=source_type,
+                        vector_type=vector_type,
+                        dimensions=dimensions,
+                        start_pos=0,
+                        end_pos=training_sample_size,
+                        config=config,
+                        verbose=verbose,
+                        trace_id=trace_id,
+                    ).astype(np.float32)
 
-            if sample_end_pos - sample_start_pos >= partitions:
-                sample_vectors = read_input_vectors(
-                    source_uri=source_uri,
-                    source_type=source_type,
-                    vector_type=vector_type,
-                    dimensions=dimensions,
-                    start_pos=sample_start_pos,
-                    end_pos=sample_end_pos,
-                    config=config,
-                    verbose=verbose,
-                    trace_id=trace_id,
-                ).astype(np.float32)
-
+                logger.debug("Start kmeans training")
                 if use_sklearn:
                     km = KMeans(
                         n_clusters=partitions,
                         init=init,
                         max_iter=max_iter,
-                        verbose=verb,
+                        verbose=3 if verbose else 0,
                         n_init=n_init,
+                        random_state=0,
                     )
                     km.fit_predict(sample_vectors)
                     centroids = np.transpose(np.array(km.cluster_centers_))
                 else:
-                    centroids = kmeans_fit(partitions, init, max_iter, verbose, n_init, array_to_matrix(np.transpose(sample_vectors)))
-                    centroids = np.array(centroids) # TODO: why is this here?
-            else:
-                centroids = np.random.rand(dimensions, partitions)
+                    from tiledb.vector_search.module import kmeans_fit
 
-            logger.debug("Start kmeans training")
+                    centroids = kmeans_fit(
+                        partitions,
+                        init,
+                        max_iter,
+                        verbose,
+                        n_init,
+                        array_to_matrix(np.transpose(sample_vectors)),
+                    )
+                    centroids = np.array(centroids)  # TODO: why is this here?
+            else:
+                # TODO(paris): Should we instead take the first training_sample_size vectors and then fill in random for the rest? Or raise an error like this:
+                # raise ValueError(f"We have a training_sample_size of {training_sample_size} but {partitions} partitions - training_sample_size must be >= partitions")
+                centroids = np.random.rand(dimensions, partitions)
 
             logger.debug("Writing centroids to array %s", centroids_uri)
             with tiledb.open(centroids_uri, mode="w", timestamp=index_timestamp) as A:
@@ -851,10 +1236,11 @@ def ingest(
         config: Optional[Mapping[str, Any]] = None,
         verbose: bool = False,
         trace_id: Optional[str] = None,
-        use_sklearn: bool = False,
+        use_sklearn: bool = True,
     ):
-        import tiledb.cloud
         from sklearn.cluster import KMeans
+
+        import tiledb.cloud
 
         def generate_new_centroid_per_thread(
             thread_id, start, end, new_centroid_sums_queue, new_centroid_counts_queue
@@ -897,12 +1283,17 @@ def ingest(
                 new_centroid_thread_sums.append(new_centroid_sums_queue)
                 new_centroid_counts_queue = mp.Queue()
                 new_centroid_thread_counts.append(new_centroid_counts_queue)
+
+                start = i
+                end = i + batch_size
+                if end > len(vectors):
+                    end = len(vectors)
                 worker = mp.Process(
                     target=generate_new_centroid_per_thread,
                     args=(
                         thread_id,
-                        i,
-                        i + batch_size,
+                        start,
+                        end,
                         new_centroid_sums_queue,
                         new_centroid_counts_queue,
                     ),
@@ -952,7 +1343,7 @@ def ingest(
             logger.debug("Assigning vectors to centroids")
             if use_sklearn:
                 km = KMeans()
-                km.n_threads_ = threads
+                km._n_threads = threads
                 km.cluster_centers_ = centroids
                 assignments = km.predict(vectors)
             else:
@@ -983,6 +1374,7 @@ def ingest(
         trace_id: Optional[str] = None,
     ):
         import numpy as np
+
         import tiledb.cloud
 
         logger = setup(config, verbose)
@@ -1104,10 +1496,10 @@ def ingest(
         trace_id: Optional[str] = None,
     ):
         import tiledb.cloud
-
-        from tiledb.vector_search.module import (StdVector_u64,
-                                                 array_to_matrix, ivf_index,
-                                                 ivf_index_tdb)
+        from tiledb.vector_search.module import StdVector_u64
+        from tiledb.vector_search.module import array_to_matrix
+        from tiledb.vector_search.module import ivf_index
+        from tiledb.vector_search.module import ivf_index_tdb
 
         logger = setup(config, verbose)
         group = tiledb.Group(index_group_uri)
@@ -1128,7 +1520,7 @@ def ingest(
             if part_end > end:
                 part_end = end
 
-            part_name = str(part) + "-" + str(part_end)
+            str(part) + "-" + str(part_end)
 
             partial_write_array_index_uri = partial_write_array_index_group[
                 str(int(part / batch))
@@ -1242,9 +1634,9 @@ def ingest(
         trace_id: Optional[str] = None,
     ):
         import tiledb.cloud
-
-        from tiledb.vector_search.module import (StdVector_u64,
-                                                 array_to_matrix, ivf_index)
+        from tiledb.vector_search.module import StdVector_u64
+        from tiledb.vector_search.module import array_to_matrix
+        from tiledb.vector_search.module import ivf_index
 
         logger = setup(config, verbose)
         group = tiledb.Group(index_group_uri)
@@ -1259,9 +1651,7 @@ def ingest(
         partial_write_array_index_group = tiledb.Group(
             partial_write_array_index_dir_uri
         )
-        partial_write_array_index_uri = partial_write_array_index_group[
-            "additions"
-        ].uri
+        partial_write_array_index_uri = partial_write_array_index_group["additions"].uri
         additions_vectors, additions_external_ids = read_additions(
             updates_uri=updates_uri,
             config=config,
@@ -1487,15 +1877,19 @@ def ingest(
         dimensions: int,
         copy_centroids_uri: str,
         training_sample_size: int,
+        training_source_uri: Optional[str],
+        training_source_type: Optional[str],
         input_vectors_per_work_item: int,
         input_vectors_work_items_per_worker: int,
+        input_vectors_per_work_item_during_sampling: int,
+        input_vectors_work_items_per_worker_during_sampling: int,
         table_partitions_per_work_item: int,
         table_partitions_work_items_per_worker: int,
         workers: int,
         config: Optional[Mapping[str, Any]] = None,
         verbose: bool = False,
         trace_id: Optional[str] = None,
-        use_sklearn: bool = False,
+        use_sklearn: bool = True,
         mode: Mode = Mode.LOCAL,
     ) -> dag.DAG:
         if mode == Mode.BATCH:
@@ -1525,6 +1919,16 @@ def ingest(
         input_vectors_batch_size = (
             input_vectors_per_work_item * input_vectors_work_items_per_worker
         )
+
+        # The number of vectors each task will read.
+        input_vectors_batch_size_during_sampling = (
+            # The number of vectors to read into memory in one batch within a task.
+            input_vectors_per_work_item_during_sampling
+            *
+            # The number of batches that a single task will need to run.
+            input_vectors_work_items_per_worker_during_sampling
+        )
+
         if index_type == "FLAT":
             ingest_node = submit(
                 ingest_flat,
@@ -1552,6 +1956,8 @@ def ingest(
                     copy_centroids,
                     index_group_uri=index_group_uri,
                     copy_centroids_uri=copy_centroids_uri,
+                    partitions=partitions,
+                    dimensions=dimensions,
                     config=config,
                     verbose=verbose,
                     trace_id=trace_id,
@@ -1560,6 +1966,67 @@ def ingest(
                     image_name=DEFAULT_IMG_NAME,
                 )
             else:
+                random_sample_nodes = []
+                if training_sampling_policy == TrainingSamplingPolicy.RANDOM:
+                    # Create an empty array to write the sampled vectors to.
+                    group = tiledb.Group(index_group_uri, "w")
+                    training_source_uri = create_array(
+                        group=group,
+                        size=training_sample_size,
+                        dimensions=dimensions,
+                        vector_type=vector_type,
+                        array_name=TRAINING_INPUT_VECTORS_ARRAY_NAME,
+                    )
+                    training_source_type = "TILEDB_ARRAY"
+                    group.close()
+
+                    idx = 0
+                    num_sampled = 0
+                    for start in range(
+                        0, size, input_vectors_batch_size_during_sampling
+                    ):
+                        # What vectors to read from the source_uri.
+                        end = start + input_vectors_batch_size_during_sampling
+                        if end > size:
+                            end = size
+
+                        # How many vectors to sample from the vectors read.
+                        percent_of_data_to_read = (end - start) / size
+                        num_to_sample = math.ceil(
+                            training_sample_size * percent_of_data_to_read
+                        )
+                        if num_sampled + num_to_sample > training_sample_size:
+                            num_to_sample = training_sample_size - num_sampled
+                        if num_to_sample == 0:
+                            continue
+
+                        random_sample_nodes.append(
+                            submit(
+                                random_sample_from_input_vectors,
+                                source_uri=source_uri,
+                                source_type=source_type,
+                                vector_type=vector_type,
+                                dimensions=dimensions,
+                                source_start_pos=start,
+                                source_end_pos=end,
+                                batch=input_vectors_per_work_item_during_sampling,
+                                random_sample_size=num_to_sample,
+                                output_source_uri=training_source_uri,
+                                output_start_pos=num_sampled,
+                                config=config,
+                                verbose=verbose,
+                                name="read-random-sample-" + str(idx),
+                                resources={"cpu": str(threads), "memory": "1Gi"},
+                                image_name=DEFAULT_IMG_NAME,
+                            )
+                        )
+                        num_sampled += num_to_sample
+                        idx += 1
+                    if num_sampled != training_sample_size:
+                        raise ValueError(
+                            f"The random sampling ran into an issue: num_sampled ({num_sampled}) != training_sample_size ({training_sample_size})"
+                        )
+
                 if training_sample_size <= CENTRALISED_KMEANS_MAX_SAMPLE_SIZE:
                     centroids_node = submit(
                         centralised_kmeans,
@@ -1569,8 +2036,9 @@ def ingest(
                         vector_type=vector_type,
                         partitions=partitions,
                         dimensions=dimensions,
-                        sample_start_pos=0,
-                        sample_end_pos=training_sample_size,
+                        training_sample_size=training_sample_size,
+                        training_source_uri=training_source_uri,
+                        training_source_type=training_source_type,
                         config=config,
                         verbose=verbose,
                         trace_id=trace_id,
@@ -1579,11 +2047,24 @@ def ingest(
                         resources={"cpu": "8", "memory": "32Gi"},
                         image_name=DEFAULT_IMG_NAME,
                     )
+
+                    for random_sample_node in random_sample_nodes:
+                        centroids_node.depends_on(random_sample_node)
                 else:
+                    uri = (
+                        training_source_uri
+                        if training_source_uri is not None
+                        else source_uri
+                    )
+                    uri_type = (
+                        training_source_type
+                        if training_source_uri is not None
+                        else source_type
+                    )
                     internal_centroids_node = submit(
                         init_centroids,
-                        source_uri=source_uri,
-                        source_type=source_type,
+                        source_uri=uri,
+                        source_type=uri_type,
                         vector_type=vector_type,
                         partitions=partitions,
                         dimensions=dimensions,
@@ -1594,6 +2075,9 @@ def ingest(
                         resources={"cpu": "1", "memory": "1Gi"},
                         image_name=DEFAULT_IMG_NAME,
                     )
+
+                    for random_sample_node in random_sample_nodes:
+                        internal_centroids_node.depends_on(random_sample_node)
 
                     for it in range(5):
                         kmeans_workers = []
@@ -1609,8 +2093,8 @@ def ingest(
                                 submit(
                                     assign_points_and_partial_new_centroids,
                                     centroids=internal_centroids_node,
-                                    source_uri=source_uri,
-                                    source_type=source_type,
+                                    source_uri=uri,
+                                    source_type=uri_type,
                                     vector_type=vector_type,
                                     partitions=partitions,
                                     dimensions=dimensions,
@@ -1835,6 +2319,17 @@ def ingest(
         group.close()
         group = tiledb.Group(index_group_uri, "w")
 
+        if training_input_vectors is not None:
+            training_source_uri = write_input_vectors(
+                group=group,
+                input_vectors=training_input_vectors,
+                size=training_input_vectors.shape[0],
+                dimensions=training_input_vectors.shape[1],
+                vector_type=training_input_vectors.dtype,
+                array_name=TRAINING_INPUT_VECTORS_ARRAY_NAME,
+            )
+            training_source_type = "TILEDB_ARRAY"
+
         if input_vectors is not None:
             in_size = input_vectors.shape[0]
             dimensions = input_vectors.shape[1]
@@ -1845,6 +2340,7 @@ def ingest(
                 size=in_size,
                 dimensions=dimensions,
                 vector_type=vector_type,
+                array_name=INPUT_VECTORS_ARRAY_NAME,
             )
             source_type = "TILEDB_ARRAY"
         else:
@@ -1860,6 +2356,11 @@ def ingest(
         logger.debug("Input dataset size %d", size)
         logger.debug("Input dataset dimensions %d", dimensions)
         logger.debug("Vector dimension type %s", vector_type)
+        if training_sample_size > size:
+            raise ValueError(
+                f"training_sample_size {training_sample_size} is larger than the input dataset size {size}"
+            )
+
         if partitions == -1:
             partitions = max(1, int(math.sqrt(size)))
         if training_sample_size == -1:
@@ -1871,20 +2372,25 @@ def ingest(
             workers = 1
         logger.debug("Partitions %d", partitions)
         logger.debug("Training sample size %d", training_sample_size)
+        logger.debug(
+            "Training source uri %s and type %s",
+            training_source_uri,
+            training_source_type,
+        )
         logger.debug("Number of workers %d", workers)
 
         if external_ids is not None:
             external_ids_uri = write_external_ids(
                 group=group,
                 external_ids=external_ids,
-                size=in_size,
+                size=size,
                 partitions=partitions,
             )
             external_ids_type = "TILEDB_ARRAY"
         else:
             if external_ids_type is None:
                 external_ids_type = "U64BIN"
-
+        # Compute task parameters for main ingestion.
         if input_vectors_per_work_item == -1:
             input_vectors_per_work_item = VECTORS_PER_WORK_ITEM
         input_vectors_work_items = int(math.ceil(size / input_vectors_per_work_item))
@@ -1903,6 +2409,38 @@ def ingest(
         logger.debug(
             "input_vectors_work_items_per_worker %d",
             input_vectors_work_items_per_worker,
+        )
+
+        # Compute task parameters for random sampling.
+        # How many input vectors to read into memory in one batch within a task.
+        if input_vectors_per_work_item_during_sampling == -1:
+            input_vectors_per_work_item_during_sampling = VECTORS_PER_SAMPLE_WORK_ITEM
+        # How many total batches we need to read all the data..
+        input_vectors_work_items_during_sampling = int(
+            math.ceil(size / input_vectors_per_work_item_during_sampling)
+        )
+        # The number of tasks to create, at max.
+        if max_sampling_tasks == -1:
+            max_sampling_tasks = MAX_TASKS_PER_STAGE
+        # The number of batches a single task will run. If there are more batches required than
+        # allowed tasks, each task will process mutiple batches.
+        input_vectors_work_items_per_worker_during_sampling = 1
+        if input_vectors_work_items_during_sampling > max_sampling_tasks:
+            input_vectors_work_items_per_worker_during_sampling = int(
+                math.ceil(input_vectors_work_items_during_sampling / max_sampling_tasks)
+            )
+            input_vectors_work_items_during_sampling = max_sampling_tasks
+        logger.debug(
+            "input_vectors_per_work_item_during_sampling %d",
+            input_vectors_per_work_item_during_sampling,
+        )
+        logger.debug(
+            "input_vectors_work_items_during_sampling %d",
+            input_vectors_work_items_during_sampling,
+        )
+        logger.debug(
+            "input_vectors_work_items_per_worker_during_sampling %d",
+            input_vectors_work_items_per_worker_during_sampling,
         )
 
         vectors_per_table_partitions = max(1, size / partitions)
@@ -1940,7 +2478,7 @@ def ingest(
             input_vectors_work_items=input_vectors_work_items,
             vector_type=vector_type,
             logger=logger,
-            storage_version=storage_version
+            storage_version=storage_version,
         )
         group.meta["temp_size"] = size
         group.close()
@@ -1959,8 +2497,12 @@ def ingest(
             dimensions=dimensions,
             copy_centroids_uri=copy_centroids_uri,
             training_sample_size=training_sample_size,
+            training_source_uri=training_source_uri,
+            training_source_type=training_source_type,
             input_vectors_per_work_item=input_vectors_per_work_item,
             input_vectors_work_items_per_worker=input_vectors_work_items_per_worker,
+            input_vectors_per_work_item_during_sampling=input_vectors_per_work_item_during_sampling,
+            input_vectors_work_items_per_worker_during_sampling=input_vectors_work_items_per_worker_during_sampling,
             table_partitions_per_work_item=table_partitions_per_work_item,
             table_partitions_work_items_per_worker=table_partitions_work_items_per_worker,
             workers=workers,

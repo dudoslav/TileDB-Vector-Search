@@ -30,7 +30,16 @@
  */
 
 #include <catch2/catch_all.hpp>
+#include "config.h"
 #include "utils/utils.h"
+
+namespace {
+
+std::string operator/(const std::string& lhs, const std::string& rhs) {
+  return (std::filesystem::path{lhs} / std::filesystem::path{rhs}).string();
+}
+
+}  // namespace
 
 TEST_CASE("utils: test", "[utils]") {
   CHECK(is_http_address("http://www.tiledb.com"));
@@ -47,14 +56,37 @@ TEST_CASE("utils: test", "[utils]") {
   CHECK(!is_s3_container("file://www.tiledb.com"));
   CHECK(!is_s3_container("www.tiledb.com"));
 
-  CHECK(is_local_file("unit_utils"));
+  static std::string cmake_source_dir{CMAKE_SOURCE_DIR};
+  CHECK(is_local_directory(cmake_source_dir));
+  CHECK(is_local_file(cmake_source_dir / "README.md"));
+  CHECK(is_local_file(cmake_source_dir / "src" / "README.md"));
+
+  CHECK(!is_local_directory(cmake_source_dir / "README.md"));
+  CHECK(!is_local_directory(cmake_source_dir / "src" / "README.md"));
+  CHECK(!is_local_array(cmake_source_dir / "README.md"));
+  CHECK(!is_local_array(cmake_source_dir / "src" / "README.md"));
+
+  std::string cmake_source_str{CMAKE_SOURCE_DIR};
+  CHECK(is_local_directory(cmake_source_str));
+  CHECK(is_local_file(cmake_source_str + "/README.md"));
+  CHECK(is_local_file(cmake_source_str + "/src/README.md"));
+
+  CHECK(!is_local_directory(cmake_source_str + "/README.md"));
+  CHECK(!is_local_directory(cmake_source_str + "/src/README.md"));
+  CHECK(!is_local_array(cmake_source_str + "/README.md"));
+  CHECK(!is_local_array(cmake_source_str + "/src/README.md"));
+
+  CHECK(is_local_file("file://" + cmake_source_str + "/README.md"));
+  CHECK(is_local_file("file://" + cmake_source_str + "/src/README.md"));
+
+  CHECK(!is_local_directory("file://" + cmake_source_str + "/README.md"));
+  CHECK(!is_local_directory("file://" + cmake_source_str + "/src/README.md"));
+  CHECK(!is_local_array("file://" + cmake_source_str + "/README.md"));
+  CHECK(!is_local_array("file://" + cmake_source_str + "/src/README.md"));
+
   CHECK(!is_local_file("unit_utils_bad_path"));
-  //  CHECK(is_local_file("../../src/test/unit_utils"));
-  CHECK(is_local_file("../test/unit_utils"));
-  CHECK(is_local_file("file://unit_utils"));
   CHECK(!is_local_file("file://unit_utils_bad_path"));
-  //  CHECK(is_local_file("file://../../src/test/unit_utils"));
-  CHECK(is_local_file("file://../test/unit_utils"));
+
   CHECK(!is_local_file("s3://www.tiledb.com/index"));
   CHECK(!is_local_file("http://www.tiledb.com"));
   CHECK(!is_local_file("https://www.tiledb.com"));
@@ -64,16 +96,9 @@ TEST_CASE("utils: test", "[utils]") {
   CHECK(is_local_directory("./"));
   CHECK(is_local_directory(".."));
   CHECK(is_local_directory("../.."));
-  CHECK(is_local_directory("../../src"));
-  CHECK(is_local_directory("../../src/test"));
+
   //  CHECK(is_local_directory("array_dense_1"));
   //  CHECK(is_local_directory("./array_dense_1"));
-  CHECK(!is_local_directory("../../src/test/unit_utils"));
-  CHECK(!is_local_directory("../../src/test/unit_utils_bad_path"));
-  CHECK(!is_local_directory("unit_utils"));
-  CHECK(!is_local_directory("unit_utils_bad_path"));
-  CHECK(!is_local_directory("file://unit_utils"));
-  CHECK(!is_local_directory("file://unit_utils_bad_path"));
   CHECK(!is_local_directory("s3://www.tiledb.com/index"));
   CHECK(!is_local_directory("http://www.tiledb.com"));
   CHECK(!is_local_directory("https://www.tiledb.com"));
@@ -83,16 +108,7 @@ TEST_CASE("utils: test", "[utils]") {
   CHECK(!is_local_array("./"));
   CHECK(!is_local_array(".."));
   CHECK(!is_local_array("../.."));
-  CHECK(!is_local_array("../../src"));
-  CHECK(!is_local_array("../../src/test"));
-  //  CHECK(is_local_array("array_dense_1"));
-  //  CHECK(is_local_array("./array_dense_1"));
-  CHECK(!is_local_array("../../src/test/unit_utils"));
-  CHECK(!is_local_array("../../src/test/unit_utils_bad_path"));
-  CHECK(!is_local_array("unit_utils"));
-  CHECK(!is_local_array("unit_utils_bad_path"));
-  CHECK(!is_local_array("file://unit_utils"));
-  CHECK(!is_local_array("file://unit_utils_bad_path"));
+
   CHECK(!is_local_array("s3://www.tiledb.com/index"));
   CHECK(!is_local_array("http://www.tiledb.com"));
   CHECK(!is_local_array("https://www.tiledb.com"));

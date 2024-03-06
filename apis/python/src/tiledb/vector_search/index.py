@@ -5,8 +5,7 @@ import time
 from typing import Any, Mapping, Optional
 
 from tiledb.vector_search.module import *
-from tiledb.vector_search.storage_formats import (STORAGE_VERSION,
-                                                  storage_formats)
+from tiledb.vector_search.storage_formats import storage_formats
 
 MAX_UINT64 = np.iinfo(np.dtype("uint64")).max
 MAX_INT32 = np.iinfo(np.dtype("int32")).max
@@ -52,9 +51,13 @@ class Index:
             raise ValueError(
                 f"Time traveling is not supported for index storage_version={self.storage_version}"
             )
-
         updates_array_name = storage_formats[self.storage_version]["UPDATES_ARRAY_NAME"]
-        self.updates_array_uri = f"{self.group.uri}/{updates_array_name}"
+        if updates_array_name in self.group:
+            self.updates_array_uri = self.group[
+                storage_formats[self.storage_version]["UPDATES_ARRAY_NAME"]
+            ].uri
+        else:
+            self.updates_array_uri = f"{self.group.uri}/{updates_array_name}"
         self.index_version = self.group.meta.get("index_version", "")
         self.ingestion_timestamps = [
             int(x)
@@ -124,17 +127,22 @@ class Index:
                     "Unexpected argument type for 'timestamp' keyword argument"
                 )
         self.thread_executor = futures.ThreadPoolExecutor()
+        self.has_updates = self.check_has_updates()
 
     def query(self, queries: np.ndarray, k, **kwargs):
         if queries.ndim != 2:
-            raise TypeError(f"Expected queries to have 2 dimensions (i.e. [[...], etc.]), but it had {queries.ndim} dimensions")
-        
+            raise TypeError(
+                f"Expected queries to have 2 dimensions (i.e. [[...], etc.]), but it had {queries.ndim} dimensions"
+            )
+
         query_dimensions = queries.shape[0] if queries.ndim == 1 else queries.shape[1]
         if query_dimensions != self.get_dimensions():
-            raise TypeError(f"A query in queries has {query_dimensions} dimensions, but the indexed data had {self.dimensions} dimensions")
+            raise TypeError(
+                f"A query in queries has {query_dimensions} dimensions, but the indexed data had {self.dimensions} dimensions"
+            )
 
         with tiledb.scope_ctx(ctx_or_config=self.config):
-            if not tiledb.array_exists(self.updates_array_uri):
+            if not self.has_updates:
                 if self.query_base_array:
                     return self.query_internal(queries, k, **kwargs)
                 else:
@@ -266,7 +274,26 @@ class Index:
     def query_internal(self, queries: np.ndarray, k, **kwargs):
         raise NotImplementedError
 
+    def check_has_updates(self):
+        with tiledb.scope_ctx(ctx_or_config=self.config):
+            array_exists = tiledb.array_exists(self.updates_array_uri)
+        if "has_updates" in self.group.meta:
+            has_updates = self.group.meta["has_updates"]
+        else:
+            has_updates = True
+        return array_exists and has_updates
+
+    def set_has_updates(self, has_updates: bool = True):
+        self.has_updates = True
+        if not self.group.meta["has_updates"]:
+            self.group.close()
+            self.group = tiledb.Group(self.uri, "w", ctx=tiledb.Ctx(self.config))
+            self.group.meta["has_updates"] = has_updates
+            self.group.close()
+            self.group = tiledb.Group(self.uri, "r", ctx=tiledb.Ctx(self.config))
+
     def update(self, vector: np.array, external_id: np.uint64, timestamp: int = None):
+        self.set_has_updates()
         updates_array = self.open_updates_array(timestamp=timestamp)
         vectors = np.empty((1), dtype="O")
         vectors[0] = vector
@@ -277,12 +304,14 @@ class Index:
     def update_batch(
         self, vectors: np.ndarray, external_ids: np.array, timestamp: int = None
     ):
+        self.set_has_updates()
         updates_array = self.open_updates_array(timestamp=timestamp)
         updates_array[external_ids] = {"vector": vectors}
         updates_array.close()
         self.consolidate_update_fragments()
 
     def delete(self, external_id: np.uint64, timestamp: int = None):
+        self.set_has_updates()
         updates_array = self.open_updates_array(timestamp=timestamp)
         deletes = np.empty((1), dtype="O")
         deletes[0] = np.array([], dtype=self.dtype)
@@ -291,6 +320,7 @@ class Index:
         self.consolidate_update_fragments()
 
     def delete_batch(self, external_ids: np.array, timestamp: int = None):
+        self.set_has_updates()
         updates_array = self.open_updates_array(timestamp=timestamp)
         deletes = np.empty((len(external_ids)), dtype="O")
         for i in range(len(external_ids)):
@@ -354,7 +384,17 @@ class Index:
                 timestamp = int(time.time() * 1000)
             return tiledb.open(self.updates_array_uri, mode="w", timestamp=timestamp)
 
-    def consolidate_updates(self, **kwargs):
+    def consolidate_updates(self, retrain_index: bool = False, **kwargs):
+        """
+        Parameters
+        ----------
+        retrain_index: bool
+            If true, retrain the index. If false, reuse data from the previous index.
+            For IVF_FLAT retraining means we will recompute the centroids - when doing so you can
+            pass any ingest() arguments used to configure computing centroids and we will use them
+            when recomputing the centroids. Otherwise, if false, we will reuse the centroids from
+            the previous index.
+        """
         from tiledb.vector_search.ingestion import ingest
 
         fragments_info = tiledb.array_fragments(
@@ -371,6 +411,19 @@ class Index:
         tiledb.consolidate(self.updates_array_uri, config=conf)
         tiledb.vacuum(self.updates_array_uri, config=conf)
 
+        # We don't copy the centroids if self.partitions=0 because this means our index was previously empty.
+        should_pass_copy_centroids_uri = (
+            self.index_type == "IVF_FLAT" and not retrain_index and self.partitions > 0
+        )
+        if should_pass_copy_centroids_uri:
+            # Make sure the user didn't pass an incorrect number of partitions.
+            if "partitions" in kwargs and self.partitions != kwargs["partitions"]:
+                raise ValueError(
+                    f"The passed partitions={kwargs['partitions']} is different than the number of partitions ({self.partitions}) from when the index was created - this is an issue because with retrain_index=True, the partitions from the previous index will be used; to fix, set retrain_index=False, don't pass partitions, or pass the correct number of partitions."
+                )
+            # We pass partitions through kwargs so that we don't pass it twice.
+            kwargs["partitions"] = self.partitions
+
         new_index = ingest(
             index_type=self.index_type,
             index_uri=self.uri,
@@ -381,6 +434,9 @@ class Index:
             updates_uri=self.updates_array_uri,
             index_timestamp=max_timestamp,
             storage_version=self.storage_version,
+            copy_centroids_uri=self.centroids_uri
+            if should_pass_copy_centroids_uri
+            else None,
             config=self.config,
             **kwargs,
         )
@@ -393,7 +449,7 @@ class Index:
                 group = tiledb.Group(uri, "m")
             except tiledb.TileDBError as err:
                 message = str(err)
-                if "group does not exist" in message:
+                if "does not exist" in message:
                     return
                 else:
                     raise err
@@ -506,4 +562,5 @@ def create_metadata(
         group.meta["index_type"] = index_type
         group.meta["base_sizes"] = json.dumps([0])
         group.meta["ingestion_timestamps"] = json.dumps([0])
+        group.meta["has_updates"] = False
         group.close()

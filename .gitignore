@@ -100,3 +100,9 @@ docs/.quarto
 
 documentation/reference/*
 documentation/reference
+
+# Mac
+*DS_Store
+
+# CMake
+*/cmake-build-*
